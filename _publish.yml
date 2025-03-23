@@ -1,0 +1,4 @@
+- source: M06-Advanced_Wrangling_dplyr.qmd
+  quarto-pub:
+    - id: 3e6d49f3-d2ad-42a2-9d7c-ecc5befd54cd
+      url: https://jmjung.quarto.pub/m06-advanced-wrangling-with-dplyr

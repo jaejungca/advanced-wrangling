@@ -1,0 +1,1279 @@
+---
+title: "M06-Advanced Wrangling with dplyr"
+author: "Jae Jung"
+date: '`r Sys.time()`'
+format: 
+  html: 
+    theme: cosmo
+    toc: true
+    toc-location: right-body
+    toc_depth: 4
+    code-fold: false
+    code-line-numbers: true
+    code-link: true
+    code-tools: true
+    number-sections: true
+    embed-resources: true
+execute: 
+  freeze: auto
+  echo: fenced
+  warning: false
+---
+
+# Topics
+
+-   joins relational databases
+-   Joining data frames when there are no unique key columns
+-   Operations across columns with across()
+-   Replace complex if else statements with case_when()
+-   Add row names to a column with rownames_to_columns()
+-   Subset distinct/unique rows with distinct()
+-   row-wise calculation with rowwise()
+
+# Packages
+
+```{r}
+library(tidyverse)
+```
+
+
+# Rankings
+
+## Integer ranking functions
+
+::: callout-note
+-   *Description*: 
+Three ranking functions inspired by SQL2003. They differ primarily in how they handle ties:
+
+    -   `row_number()` gives every input a unique rank, so that c(10, 20, 20, 30) would get ranks c(1, 2, 3, 4). It's equivalent to rank(ties.method = "first").
+    
+    -   `min_rank()` gives every tie the same (smallest) value so that c(10, 20, 20, 30) gets ranks c(1, 2, 2, 4). It's the way that ranks are usually computed in sports and is equivalent to rank(ties.method = "min").
+    
+    -   `dense_rank()` works like min_rank(), but doesn't leave any gaps, so that c(10, 20, 20, 30) gets ranks c(1, 2, 2, 3).
+:::
+
+```{r}
+x <- c(5, 1, 3, 2, 2, NA)
+row_number(x)
+min_rank(x)
+dense_rank(x)
+
+# Example
+df <- data.frame(
+  grp = c(1, 1, 1, 2, 2, 2, 3, 3, 3),
+  x = c(3, 2, 1, 1, 2, 2, 1, 1, 1),
+  y = c(1, 3, 2, 3, 2, 2, 4, 1, 2),
+  id = 1:9
+)
+
+df |> 
+  group_by(grp) |> 
+  mutate(grp_id = row_number())
+```
+
+## Proportional ranking functions
+
+::: callout-note
+-   *Description*: These two ranking functions implement two slightly different ways to compute a percentile. For each x_i in x:
+
+    -   `cume_dist(x)` counts the total number of values less than or equal to x_i, and divides it by the number of observations.
+    
+    -  ` percent_rank(x)` counts the total number of values less than x_i, and divides it by the number of observations minus 1.
+    
+    -   In both cases, missing values are ignored when counting the number of observations.
+
+:::
+
+```{r}
+# Example
+x <- c(5, 1, 3, 2, 2)
+
+cume_dist(x) # is the same as below
+sapply(x, function(xi) sum(x <= xi) / length(x))
+
+percent_rank(x) # is the same as below
+sapply(x, function(xi) sum(x < xi)  / (length(x) - 1))
+
+```
+
+## Bucket a numeric vector into n groups
+
+::: callout-note
+-   Description: `ntile()` is a sort of very rough rank, which breaks the input vector into n buckets. 
+    -   If length(x) is not an integer multiple of n, the size of the buckets will differ by up to one, with larger buckets coming first.
+
+    -   Unlike other ranking functions, ntile() ignores ties: it will create evenly sized buckets even if the same value of x ends up in different buckets.
+
+    -   Usage: ntile(x = row_number(), n)
+:::
+
+```{r}
+x <- c(5, 1, 3, 2, 2, NA)
+ntile(x, 2)
+ntile(x, 4)
+
+# If the bucket sizes are uneven, the larger buckets come first
+ntile(1:8, 3)
+
+# Ties are ignored
+ntile(rep(1, 8), 3)
+```
+
+## row_number() / between()
+
+```{r}
+# row_number can be used with single table verbs without specifying x
+# (for data frames and databases that support windowing)
+
+mtcars <- mtcars |> 
+  as_tibble()
+
+mutate(mtcars, row_number() == 1L)
+mutate(mtcars, row_number() == 2L)
+mutate(mtcars, row_number() == 3)
+
+mtcars |> row_number()
+
+# 
+between(1:12, 7, 9) # inclusive
+
+x <- rnorm(1e2) # rnorm(n, mean = 0, sd = 1)
+x[between(x, -1, 1)]
+
+## Or on a tibble using filter
+filter(starwars, between(height, 100, 150))
+
+mtcars %>% head()
+mtcars %>% filter(between(row_number(), 3, 6))
+
+mtcars %>% filter(between(mpg, 20, 25))
+mtcars %>% filter(mpg >= 20, mpg <= 25)
+
+mutate(mtcars, rank_hp = row_number(hp)) %>% 
+  arrange(hp)
+
+mtcars %>% select(mpg) %>% head() %>% 
+  row_number()
+
+```
+
+# Relational Data and Joins
+
+> To work with relational data you need verbs that work with pairs of tables. There are three families of verbs designed to work with relational data:
+
+-   Mutating joins
+    -   add new variables to one data frame from matching observations in another.
+    -   Types
+        -   inner_join(),
+        -   left_join(),
+        -   right_join(),
+        -   full_join(),
+
+-   Filtering joins
+    -   filter observations from one data frame based on whether or not they match an observation in the other table.
+    -   semi_join(),
+    -   anti_join(). 
+
+-   Set operations
+    -   treat observations as if they were set elements.
+
+## Data
+
+```{r}
+library(tidyverse)
+library(nycflights13) #nycflights13 contains four tibbles that are related to the flights table that you used in data transformation:
+flights
+airlines #the full carrier name from its abbreviated code:
+airports #information about each airport, identified by the faa airport code:
+planes #information about each plane, identified by its tailnum:
+weather #the weather at each NYC airport for each hour:
+```
+
+## Keys (primary vs. foreign)
+
+::: callout-note
+-   The variables used to connect each pair of tables are called keys. A key is a variable (or set of variables) that uniquely identifies an observation.
+-   In simple cases, a single variable is sufficient to identify an observation. - For example, each plane is uniquely identified by its tailnum.
+-   In other cases, multiple variables may be needed.
+    -   For example, to identify an observation in weather you need five variables: `year, month, day, hour, and origin`.
+:::
+
+-   A **primary key** uniquely identifies an observation in its own table. For example, `planes$tailnum` is a primary key because it uniquely identifies each plane in the planes table.
+
+-   A **foreign key** uniquely identifies an observation in another table. For example, `flights$tailnum` is a foreign key because it appears in the flights table where it matches each flight to a unique plane.
+
+```{r}
+# plane$tailnum is primary key
+planes %>% 
+  count(tailnum) %>% 
+  filter(n > 1) # confirm there is no duplicates; the same can be accomplished with the following operation.
+
+planes %>% 
+  select(tailnum) %>% 
+  duplicated() %>% 
+  max()
+
+# flights$tailnum is a foreign key
+flights %>% 
+  count(tailnum) %>% 
+  filter(n > 1) |> 
+  arrange(-n)
+
+weather %>% 
+  count(year, month, day, hour, origin) %>% 
+  filter(n > 1) # the output confirms that there are some duplicates. Thus, it is not a primary key.
+
+# airports$faa can be a primary key
+airports %>% 
+  count(faa) %>% # faa: airport code = origin
+  filter(n > 1) # confirms that there is no duplicates
+
+# Sometimes a table doesn't have an explicit primary key: each row is an observation, but no combination of variables reliably identifies it. 
+# For example, what's the primary key in the flights table? You might think it would be the date plus the flight or tail number, but neither of those are unique:
+flights %>% 
+  count(year, month, day, flight) %>% 
+  filter(n > 1)
+
+flights %>% 
+  count(year, month, day, tailnum) %>% 
+  filter(n > 1)
+```
+
+::: callout-caution
+If a table lacks a primary key, it's sometimes useful to add one with mutate() and row_number(). That makes it easier to match observations if you've done some filtering and want to check back in with the original data. This is called a `*surrogate key*`.
+:::
+
+::: callout-tip
+A `primary` key and the corresponding `foreign` key in another table form a *relation*. Relations are typically one-to-many. For example, each `flight` has one plane, but each `plane` has many flights. In other data, you'll occasionally see a 1-to-1 relationship. You can think of this as a special case of 1-to-many. You can model many-to-many relations with a many-to-1 relation plus a 1-to-many relation. For example, in this data there's a many-to-many relationship between airlines and airports: each airline flies to many airports; each airport hosts many airlines.
+:::
+
+## Mutating Joins
+
+A mutating join allows you to combine variables from two tables. It first matches observations by their keys, then copies across variables from one table to the other.
+
+```{r}
+flights2 <- flights %>% 
+  select(year:day, hour, origin, dest, tailnum, carrier)
+flights2
+
+flights2 %>%
+  select(-origin, -dest) %>% 
+  left_join(airlines, by = "carrier") # this is the same as below.
+
+flights2 %>%
+  select(-origin, -dest) %>% 
+  mutate(name = airlines$name[match(carrier, airlines$carrier)])
+```
+
+-   Data set for illustration
+
+```{r}
+x <- tribble(
+  ~key, ~val_x,
+     1, "x1",
+     2, "x2",
+     3, "x3"
+)
+y <- tribble(
+  ~key, ~val_y,
+     1, "y1",
+     2, "y2",
+     4, "y3"
+)
+```
+
+### Inner Joins
+
+-   An inner join keeps observations that appear in both tables.
+-   The most important property of an inner join is that unmatched rows are not included in the result.
+-   Inner joins are usually *not appropriate* for use in analysis because it's too easy to lose observations.
+
+```{r}
+x %>% 
+  inner_join(y, by = "key")
+```
+
+### Outer joins
+
+An outer join keeps observations that appear in at least one of the tables. There are *three types* of outer joins:
+
+#### Left joins
+
+-   A left join keeps all observations in x.
+-   The *most commonly used* join is the left join:
+-   you use this whenever you look up additional data from another table, because it preserves the original observations even when there isn't a match.
+-   The left join should be *your default join*: use it unless you have a strong reason to prefer one of the others.
+
+```{r}
+x
+y
+
+x %>% 
+  left_join(y, by = "key" )
+```
+
+#### Right joins
+
+-   A right join keeps all observations in y.
+
+```{r}
+x %>% 
+  right_join(y, by = "key" )
+```
+
+#### Full joins
+
+-   A full join keeps all observations in x and y.
+
+```{r}
+x %>% 
+  full_join(y, by = "key" )
+```
+
+### Duplicate keys
+
+What will happen when keys are not unique?
+
+#### One table has duplicate keys.
+
+This is useful when you want to add in additional information as there is typically a *one-to-many* relationship
+
+```{r}
+x <- tribble(
+  ~key, ~val_x,
+     1, "x1",
+     2, "x2",
+     2, "x3",
+     1, "x4"
+)
+y <- tribble(
+  ~key, ~val_y,
+     1, "y1",
+     2, "y2"
+)
+left_join(x, y, by = "key")
+
+```
+
+#### Both tables have duplicate keys.
+
+This is usually an error because in neither table do the keys uniquely identify an observation. When you join duplicated keys, you get all possible combinations, the *Cartesian product*:
+
+```{r}
+x <- tribble(
+  ~key, ~val_x,
+     1, "x1",
+     2, "x2",
+     2, "x3",
+     3, "x4"
+)
+y <- tribble(
+  ~key, ~val_y,
+     1, "y1",
+     2, "y2",
+     2, "y3",
+     3, "y4"
+)
+left_join(x, y, by = "key", relationship = "many-to-many")
+```
+
+### Defining the key columns
+
+#### Default mode
+
+The default, by = NULL, uses all variables that appear in both tables, the so called *natural join*.
+
+```{r}
+flights2 %>% 
+  left_join(weather)
+```
+
+#### A character vector, by = "x"
+
+```{r}
+flights2 %>% 
+  left_join(planes, by = "tailnum") # specify the variable that is common to use.
+```
+
+#### A named character vector: by = c("a" = "b")
+
+This will match variable a in table x to variable b in table y. The variables from x will be used in the output.
+
+```{r}
+flights2 %>% 
+  left_join(airports, c("dest" = "faa"))
+
+flights2 %>% 
+  left_join(airports, c("origin" = "faa"))
+```
+
+### base::merge()
+
+-   can perform all four types of mutating join:
+
+```         
+merge(x, y, ...)
+
+## Default S3 method:
+merge(x, y, ...)
+
+merge(x, y, by = intersect(names(x), names(y)),
+      by.x = by, by.y = by, all = FALSE, all.x = all, all.y = all,
+      sort = TRUE, suffixes = c(".x",".y"), no.dups = TRUE,
+      incomparables = NULL, ...)
+```
+
+
+
+## Filtering joins
+
+> Filtering joins match observations in the same way as mutating joins, but affect the observations, not the variables. There are *two types*:
+
+-   semi_join(x, y) keeps all observations in x that have a match in y.
+-   anti_join(x, y) drops all observations in x that have a match in y.
+
+::: callout-important
+-   Only the existence of a match is important; it doesn't matter which observation is matched. This means that filtering joins never duplicate rows like mutating joins do:
+:::
+
+### Semi joins
+
+Semi-joins are useful for matching filtered summary tables back to the original rows.
+
+-   only keeps the rows in x that have a match in y:
+
+```{r}
+#For example, imagine you've found the top ten most popular destinations:
+
+top_dest <- flights %>%
+  count(dest, sort = TRUE) %>%
+  head(10)
+top_dest
+
+# Now you want to find each flight that went to one of those destinations. You could construct a filter yourself:
+
+flights %>% 
+  filter(dest %in% top_dest$dest) |> 
+  select(dest)
+
+# Using semi join, we can achieve the above filtering.
+flights %>% 
+  semi_join(top_dest)
+```
+
+### Anti joins
+
+-   The *inverse of a semi-join* is an anti-join.
+-   An anti-join keeps the rows that don't have a match:
+-   Anti-joins are useful for *diagnosing join mismatches*.
+
+```{r}
+flights %>%
+  anti_join(planes, by = "tailnum") %>%
+  count(tailnum, sort = TRUE)
+```
+
+
+## Join problems
+
+::: callout-tip
+-   Expect to have some problems when gathering data in your own.
+-   Take some measures to minimize the problems
+:::
+
+### (1) Identify primary key
+
+-   Start by identifying the variables that form the primary key in each table. You should usually do this based on your understanding of the data, not empirically by looking for a combination of variables that give a unique identifier.
+-   If you just look for variables without thinking about what they mean, you might get (un)lucky and find a combination that's unique in your current data but the relationship might not be true in general.
+
+```{r}
+# For example, the altitude and longitude uniquely identify each airport, but they are not good identifiers!
+airports %>% count(alt, lon) %>% filter(n > 1)
+```
+
+### (2) Check that none of the variables in the primary key are missing.
+
+If a value is missing then it can't identify an observation!
+
+### (3) Check that your foreign keys match primary keys in another table.
+
+-   The best way to do this is with an anti_join(). It's common for keys not to match because of data entry errors. Fixing these is often a lot of work.
+
+-   If you do have missing keys, you'll need to be thoughtful about your use of inner vs. outer joins, carefully considering whether or not you want to drop rows that don't have a match.
+
+-   Be aware that simply checking the number of rows before and after the join is not sufficient to ensure that your join has gone smoothly.
+
+## Set operations
+
+-   Useful when you want to break a single complex filter into simpler pieces.
+-   All these operations work with a complete row, comparing the values of every variable.
+-   These expect the x and y inputs to have the same variables, and treat the observations like sets:
+
+```{r}
+df1 <- tribble(
+  ~x, ~y,
+   1,  1,
+   2,  1
+)
+df2 <- tribble(
+  ~x, ~y,
+   1,  1,
+   1,  2
+)
+```
+
+### intersect()
+
+intersect(x, y): return only observations in both x and y.
+
+```{r}
+df1
+df2
+
+intersect(df1, df2)
+```
+
+### union()
+
+union(x, y): return unique observations in x and y.
+
+```{r}
+# Note that we get 3 rows, not 4
+union(df1, df2)
+```
+
+### setdiff()
+
+setdiff(x, y): return observations in x, but not in y.
+
+```{r}
+df1
+df2
+
+setdiff(df1, df2)
+setdiff(df2, df1)
+```
+
+# Joining data frame when there are no unique key columns 
+
+-   Situation: Neither data frame has a unique key column. The closest equivalent of the key column is the dates variable of monthly data. Each df has multiple entries per month, so the dates column has lots of duplicates.
+
+## Data
+
+```{r}
+df_1 <- tibble(
+  dates = c(as.Date("2018-07-01"), as.Date("2018-06-01"), as.Date("2018-06-01"), as.Date("2018-05-01")),
+  x1 = c(10L, 11L, 12L, 13L),
+  text1 = c("text a", "text b", "text c", "text d")
+)
+
+df_2 <- tibble(
+  dates = c(as.Date("2018-07-01"), as.Date("2018-06-01"), as.Date("2018-05-01"), as.Date("2018-04-01")),
+  x2 = c(20L, 21L, 22L, 23L),
+  text2 = c("text aa", "text bb", "text cc", "text dd")
+)
+  
+df_1
+df_2
+```
+
+## left_join()
+```{r}
+
+df_1 %>% 
+  left_join(df_2) # duplicate problem
+
+# solution
+left_join(df_1 %>% group_by(dates) %>% mutate(id = row_number()),
+          df_2 %>% group_by(dates) %>% mutate(id = row_number()), 
+          by = c("dates", "id"))
+
+df_1 %>% 
+  group_by(dates) %>% 
+  mutate(id = row_number()) %>% 
+  left_join(df_2 %>% group_by(dates) %>% mutate(id = row_number()),
+            by = c("dates", "id"))
+
+# even though I didn't give "by" argument, I get the identical outcome.
+left_join(df_1 %>% group_by(dates) %>% mutate(id = row_number()),
+          df_2 %>% group_by(dates) %>% mutate(id = row_number()))
+```
+
+## full_join()
+
+```{r}
+df_1 %>% 
+  full_join(df_2) # duplicate problem
+
+full_join(df_1 %>% group_by(dates) %>% mutate(id = row_number()),
+          df_2 %>% group_by(dates) %>% mutate(id = row_number()), 
+          by = c("dates", "id"))
+
+full_join(df_1 %>% group_by(dates) %>% mutate(id = row_number()),
+          df_2 %>% group_by(dates) %>% mutate(id = row_number()))
+```
+
+# Column-wise operations with across()
+
+## Data
+
+```{r}
+#data() # list all data available
+data(starwars) # Loads specified data sets
+starwars # print the data set
+?starwars # review starwars characters dataset from dplyr
+glimpse(starwars)
+```
+
+## Introduction
+Column-wise operations with across()
+
+-   dplyr has had more capability for functions for operating on columns than on rows but it was not always convenient.
+-   If you want to perform the same operation on multiple columns, copying and pasting could be tedious and error prone:
+
+```{{r}}
+df %>% 
+      group_by(g1, g2) %>% 
+      summarise(a = mean(a), b = mean(b), c = mean(c), d = mean(d)) # the same as below
+```
+
+-   We can now use the across() function to write this kind of operation more succinctly and transparently:
+
+**across syntax**
+
+```{{r}}
+df %>% 
+      group_by(g1, g2) %>% 
+      summarise(across(a:d, mean))
+```
+
+-   across() provides new functionality while replacing older functions such as `mutate_if()` or `mutate_at()`
+
+
+## Basic Usage
+
+-   `across()` is only used inside other functions, e.g., `summarize()` or `mutate()`
+-   across() doesn't work with select() or rename() because they already use tidy select syntax;
+
+-   Like group_by() and rowwise(), it does not change the data itself but changes how other functions operate on the data.
+
+-   across() has two **primary arguments**:
+
+  + `.cols` = selects the columns you want to manipulate (notice the period at the beginning).
+  + It uses tidy selection (like select()) so you can pick variables by position, name, and type.
+  + The default is .cols = everything() so all columns are selected
+    
+  + `.fns` = , is a function (or a list of functions) you want to apply to each column (.again, note the period at the beginning of the argument name)
+    + Examples: `.fns = mean` or `.fns = max`
+    + This can also be a purrr style formula like `~ .x / 2.`
+    + The .x is the a pronoun for the columns that get passed to the function
+    + This argument is optional so you can omit it to leave the data untransformed
+
+### Using across() with summarize()
+
+- Here are a couple of examples of across() in conjunction with its favorite verb, summarize().
+- We use `where() `inside the across() to select only those columns of the desired type
+- `.fns=` can take a single function
+- You can add additional arguments to be passed to the function, e.g., `na.rm = TRUE`.
+
+```{r}
+skimr::skim(starwars)
+
+starwars %>% 
+  summarize(height_mean = mean(height, na.rm = TRUE),
+            mass_mean = mean(mass, na.rm = TRUE)) # too much typing
+
+starwars %>% 
+  summarize(across(.cols = height:mass, .fns = mean, na.rm = TRUE)) # this is better
+```
+
+### Using summarize()/where(is.numeric) or where(is.character)
+
+- `where()` is from {tidyselect}	
+- This selection helper selects the variables for which a function returns TRUE.
+- is.numeric() is from base R
+- `is.numeric` is a more general test of an object being interpretable as numbers.
+
+#### Numeric vectors
+```{r}
+starwars %>% 
+  summarise(across(where(is.numeric), 
+                   .fns = median)) # NA's because of missing values
+starwars %>% 
+  summarise(across(.cols = where(is.numeric), #.cols can be omitted
+                   .fns = median, # .fns can be omitted
+                   na.rm = TRUE))
+
+starwars %>% 
+  summarise(across(where(is.numeric), 
+                   median,
+                   na.rm = TRUE))
+
+```
+
+#### Formula approach
+
+-   The formula approach gives us the ability to combine functions with arguments. 
+-   Using this, you start with the `~` to signify "as a function of" and then put wherever your column name would normally as a .x.
+
+```{r}
+starwars %>% 
+          summarise(across(where(is.numeric), min, na.rm = TRUE)) # the same as below
+
+starwars %>% 
+          summarise(across(where(is.numeric), 
+                           ~ min(.x, na.rm = TRUE)))
+
+starwars %>% 
+          summarise(across(where(is.numeric), 
+                           ~ median(.x, na.rm = TRUE)))
+
+starwars %>% 
+  group_by(homeworld) %>% 
+  filter(n() > 1) %>% 
+  summarise(across(where(is.numeric),
+                   ~ max(.x, na.rm = TRUE))) # same as below
+
+starwars %>% 
+  group_by(homeworld) %>% 
+  filter(n() > 1) %>% 
+  summarise(across(where(is.numeric),
+                   max, na.rm = TRUE))
+```
+
+### Using character vectors: `where`, `is.character`, `length()`
+
+
+> Task: Count unique values for character variables using formula style
+
+- is.character() is from base R
+- Create or test for objects of type "character".
+
+  
+```{r}
+# find the number of unique values in character variables
+summary(starwars) # ugly output due to the fact that there are lists.
+class(starwars)
+skimr::skim(starwars) # can tell you the answer: 12 unique value, not counting NA
+
+unique(starwars$hair_color) # unique() is a base R function: the same as below
+
+starwars %>% 
+  pull(hair_color) %>% 
+  unique()
+
+
+# testing with one variable first
+starwars %>% 
+  summarize(unique(hair_color)) 
+
+starwars %>% 
+  summarize(length(unique(hair_color)) 
+            )
+
+# Applying to all variables
+starwars %>% 
+  summarize(across(where(is.character),
+                   ~ length(unique(.x)) 
+                   )
+            )
+```
+
+### Example: multiple summaries
+
+Example with group by species and filter for groups with >1 row and adding a summary that is not inside across to count the rows in each group
+
+```{r}
+starwars %>% 
+  group_by(species) %>% 
+  filter(n() > 1) %>%                   
+  summarise(across(c(sex, gender, homeworld), 
+                   ~ length(unique(.x))),
+            n = n())                   
+            
+
+# what happens if we add n = n() first.
+# The only difference: n comes after species and before other variables.
+starwars %>% 
+  group_by(species) %>% 
+  filter(n() > 1) %>% 
+  summarise(n = n(),
+            across(c(sex, gender, homeworld), 
+                   ~ length(unique(.x))))
+
+# cf.
+starwars %>% 
+  filter(n() > 1) %>% 
+  count(species, sex, gender, homeworld)
+```
+
+### across(), not selecting grouping variables 
+
+-   Because across() is usually used in combination with summarize() and mutate(), it doesn't select grouping variables to avoid accidentally modifying them:
+
+-   Example where the grouping variable g is not selected, even though it is numeric, so is not summed.
+
+```{r}
+across <- data.frame(g = c(1, 1, 2), x = c(-1, 1, 3), y = c(-1, -4, -9))
+across
+
+across %>% 
+  group_by(g) %>% 
+  summarize(across(where(is.numeric), sum)
+            ) # the same as below
+
+across %>% 
+  group_by(g) %>% 
+  summarize(across(where(is.numeric), ~ sum(.x))
+            )
+
+```
+
+## Using across() with Multiple Functions
+
+-   You can transform each variable with more than one function
+-   Supply a named list of functions in the second argument:
+
+```{r}
+# Example with no list but argument
+starwars %>% 
+  summarise(across(where(is.numeric),
+                   .fns = list(median, mean), na.rm = TRUE)
+            )  
+
+# Example with list and argument
+
+starwars %>% 
+  summarize(across(where(is.numeric), 
+                   list(min = min, max = max, mean = mean), # column = function
+                   na.rm = TRUE))
+starwars %>% 
+  summarise(across(where(is.numeric),
+                   .fns = list(Median = median, Mean = mean), na.rm = TRUE) # Median is the name, while mean is the function. names always precede functions.
+            )  
+```
+
+## Controlling names with `glue()`
+
+- In the last case where we wanted to create a median and mean across all numeric variables, you'll notice that the new variable names were always {name_of_variable}_{mean/median}. This is the default behavior of across - the name, an underscore, and the name of the function from the named list provided. 
+-   To customize how things are named, you can use glue syntax (we will cover what glue is in a few weeks) and the .names argument.
+
+* {.fn} will refer to the name of the function you used
+* {.col} will refer to the name of the column
+
+```{r}
+#change default, {.col}_{.fn} to {.fn}_{.col}
+starwars %>% 
+  summarise(across(.cols = where(is.numeric),
+                   .fns = list(Median = median, Mean = mean), 
+                   na.rm = TRUE, 
+                   .names = "{.fn}_{.col}") # default: "{.col}_{.fn}" when multiple function is used
+            )  
+
+#change to greater customization
+starwars %>% 
+  summarise(across(where(is.numeric),
+                   .fns = list(Median = median, Mean = mean), 
+                    na.rm = TRUE,
+                   .names = "The {.fn} of {.col}"))  
+```
+
+
+## Order matters
+
+* Be careful when combining numeric summaries with `is.numeric()`:
+
+```{r}
+number <- data.frame(x = c(1, 2, 3), y = c(1, 4, 9))
+number
+
+# Here n became NA because n is numeric, so the across() computes its standard deviation, and 
+# the standard deviation of 3 (a constant) is NA.
+number %>% 
+  summarise(n = n(),
+            across(where(is.numeric), sd))
+
+# You probably want to compute n() last to avoid this problem:
+number %>% 
+  summarise(across(where(is.numeric), sd), 
+            n = n())
+```
+
+## Examples
+
+### Example 1
+
+* Find all rows where no variable has missing values:
+
+```{r}
+starwars %>% 
+  filter(across(everything(), ~ !is.na(.x))) # we cannot do without "~" since we have "!"
+```
+
+### Example 2
+* Find all distinct rows for variables with the word color in the name
+* For some verbs, like group_by(), count() and distinct(), you can omit the summary functions:
+
+```{r}
+starwars %>% 
+  distinct(across(contains("color"))) %>% 
+  arrange(hair_color, skin_color)
+```
+
+### Example 3
+* Count all combinations of variables with a given pattern:
+
+```{r}
+starwars %>% 
+  count(across(contains("color")), sort = TRUE)
+
+starwars %>% 
+  count(across(contains("color")), sort = TRUE) %>% 
+  arrange(hair_color, skin_color)
+
+starwars %>% 
+  count(across(contains("color"))) %>% 
+  arrange(hair_color, skin_color)
+```
+
+## Exercise
+
+### median
+* Calculate the median for each numeric variable for each species and gender
+
+```{r}
+glimpse(starwars)
+
+starwars %>% 
+  group_by(species, gender) %>% 
+  summarise(across(where(is.numeric), ~ median(.x, na.rm = TRUE))
+            )
+```
+
+### min & max, count, sort
+
+Calculate the min and max for each numeric variable other than birth year for each species and gender and count how many are in each group and sort from largest to smallest count.
+
+```{r}
+starwars %>% 
+  group_by(species, gender) %>% 
+  summarise(across(where(is.numeric) & !birth_year,
+                   .fns = list(min = min, max = max),
+                   na.rm = TRUE,
+                   .names = "{.fn}_{.col}"),
+            n = n()) %>% 
+  arrange(desc(n))
+
+# same as above
+starwars %>% 
+  group_by(species, gender) %>% 
+  summarise(across(where(is.numeric) & !birth_year,
+                   .fns = list(min = ~ min(.x, na.rm = TRUE), 
+                               max = ~ max(.x, na.rm = TRUE))),
+            n = n()) %>% 
+  arrange(desc(n)) %>% 
+  ungroup()
+                   
+```
+
+# case_when()
+
+- This function allows you to vectorize (and replace) multiple if_else() statements in a succinct and clear manner.
+
+- The syntax is case_when(...)
+
+- The dot dot dots are a placeholder for a series of two-side formulas
+
+    - The Left hand side (LHS) determines which variables match a given case - this must return a logical vector
+    - The Right hand side (RHS) provides the new or replacement value and all have to be of the same type of vector
+    - Both LHS and RHS may be of length either 1 or n
+    - you always end with a case of TRUE for when all of the other cases are FALSE
+
+* Example of a vectorized if - else
+
+
+```{r}
+x <- 1:50
+
+case_when(               
+  x < 5 ~ "less than 5",   # start with specific cases first
+  x < 10 ~ "less than 10",
+  TRUE ~ as.character(x)
+)
+```
+
+## fizzbuz problem
+
+* From <https://www.hackerrank.com/challenges/fizzbuzz/problem>
+
+```{r}
+case_when(
+  x %% 15 == 0 ~ "fizz buzz",
+  x %% 3 == 0 ~ "fizz",
+  x %% 5 == 0 ~ "buzz",
+  TRUE ~ as.character(x)
+)
+```
+
+## Caveat
+* Like an if statement, the arguments are evaluated in order, so you must proceed from the most specific to the most general.
+* This won't work:
+
+```{r}
+case_when(
+  x %%  5 == 0 ~ "fizz",
+  x %%  7 == 0 ~ "buzz",
+  x %% 35 == 0 ~ "fizz buzz", # notice that for 35, fizz was printed instead of fizz buzz.
+  TRUE ~ as.character(x),
+)
+```
+
+
+## with `mutate()`
+`
+- case_when() is particularly useful inside mutate() when you want to create a new variable that relies on a complex combination of existing variables
+
+```{r}
+starwars %>%
+  select(name:mass, gender, species) %>%
+  mutate(height_cat = case_when(height > 191 ~ "tall",
+                                height < 167 ~ "short",
+                                TRUE ~ "average") )
+
+# using quantile()
+starwars %>%
+  select(name:mass, gender, species) %>%
+  mutate(height_cat = case_when(height > quantile(height, 3/4, na.rm = TRUE) ~ "tall",
+                                height < quantile(height, 1/4, na.rm = TRUE) ~ "short",
+                                TRUE  ~ "average") )   
+
+# But this can be even more complicated... 
+starwars %>%
+  select(name:mass, gender, species) %>%
+  mutate(type = case_when(height >= 200 | mass >= 200 ~ "large",
+                          species == "Droid"        ~ "robot",
+                          TRUE                      ~ "other" ) )
+```
+
+# rownames_to_column()
+
+tibble::rownames_to_columns()
+- You many occasionally see data sets where there are row names.
+- This is allowed but not common with data frames as row names are removed when using [...]
+- Tidy data (a tibble) does not use row_names so they are stripped when coerced to a tibble
+- Generally, it is best to avoid row names, because they are basically a character column with different semantics than every other column.
+- To detect if a data frame has row_names use `has_rownames()`
+
+```{r}
+head(state.x77)
+#view(state.x77)
+class(state.x77)
+str(state.x77)
+has_rownames(state.x77) # doesn't recognize rownames since the data is matrix.
+has_rownames(as_tibble(state.x77)) # doesn't recognize it either since tibble removes the row names.
+has_rownames(as.data.frame(state.x77)) # yes it does.
+
+state.x77 %>% 
+  as.data.frame() %>% 
+  rownames_to_column("state") %>% 
+  #str() %>% 
+  as_tibble()
+```
+
+## Exercise
+
+Check if the mtcars data set has row names. If so, convert the rownames to a column named car and convert to a tibble
+```{r}
+head(mtcars)
+class(mtcars)
+has_rownames(mtcars)
+
+mtcars %>% 
+  rownames_to_column("car") %>% 
+  as_tibble()
+```
+
+# distinct()
+
+-   `distinct()` subsets only unique/distinct rows from a data frame.
+-   Rows are a subset of the input but appear in the same order.
+-   Columns are not modified by default
+-   Groups are not modified.
+-   Data frame attributes are preserved.
+
+```{r}
+starwars %>% 
+  distinct(homeworld) 
+
+starwars %>% 
+  distinct(homeworld, species) # this is the same as below
+
+starwars %>% 
+  count(homeworld, species) # it has n additionally, so it can be more useful
+
+library(gapminder)
+data("gapminder")
+
+# how many countries are in each continent?
+
+gapminder %>% 
+  count(continent) # incorrect as there are 12 years of data for each country
+
+gapminder %>% 
+  count(country, continent) # still incorrect
+
+gapminder %>% 
+  distinct(country, continent) %>% 
+  count(continent) # correct
+```
+
+# row-wise operation with `rowwise()`
+
+-   Before version 1.0, dplyr did not have special capabilities for operating on subsets of rows. You had to use for-loops for operating across rows or subsets of rows.
+
+-   dplyr 1.0 added the new verb rowwise() to create multiple one-row data frames out of an existing data frame
+
+-   These row-wise data frames are "virtual" subsets of the original data frame - - You can operate on each subset data frame as if it were its own data frame.
+
+-   We will discuss a common use case: computing aggregates across multiple columns within a row
+
+## Creating row-wise data frames
+
+-   Row-wise operations require a special type of grouping where each group consists of a single row.
+-   You create this grouping using rowwise()
+-   Like group_by(), rowwise() doesn't really do anything itself; it just changes how the other dplyr verbs work.
+-   For example, compare the results of mutate() in the following code:
+
+```{r}
+fruits <- tribble(
+  ~"fruit", ~"height_1", ~"height_2", ~"height_3", ~"width", ~"weight",
+  "Banana", 4, 4.2, 3.5, 1, 0.5,
+  "Strawberry", 1, .9, 1.2, 1, .25,
+  "Pineapple", 18, 17.7, 19.2, 6, 3)
+fruits
+
+# mean across all values in all rows
+fruits %>% 
+  mutate(height_mean = mean(c(height_1, height_2, height_3))) 
+
+# mean across all values in each row
+fruits %>% 
+  rowwise(fruit) %>% 
+  mutate(height_mean = mean(c(height_1, height_2, height_3))) # must use c()
+
+fruits %>% 
+  rowwise(fruit) %>% 
+  mutate(height_mean = mean(height_1:height_3)) # Why is the mean different from above?
+
+# Using c_across: See the next section
+fruits %>% 
+  rowwise(fruit) %>% 
+  mutate(height_mean = mean(c_across(height_1:height_3))) # correct
+
+fruits %>% 
+  rowwise(fruit) %>% 
+  mutate(height_mean = mean(c_across(contains("height")))) # correct
+
+```
+
+## Per-row Summary Statistics
+
+-   dplyr::summarize() makes it really easy to summarize values across the rows within one column.
+-   We can combine rowwise() and summarize() to make it easy to summarize values across columns within one row.
+-   Let's say we want to compute the sum of w, x, y, and z for each row.
+-   We start by making a row-wise data frame:
+-   We then use mutate() to add a new column to each row, or.
+-   Just use summarise() to return the summary:
+
+```{r}
+df <- tibble(id = 1:6, w = 10:15, x = 20:25, y = 30:35, z = 40:45)
+df
+
+rf <- df %>% rowwise(id)
+
+# mutate to add new column for each row
+rf %>% mutate(total = sum(c(w, x, y, z)))
+
+# summarize without mutate
+rf %>% summarise(total = sum(c(w, x, y, z)), 
+                 .groups= "drop") # the same as ungroup()
+
+```
+
+## Using `c_across`
+
+-   If you have a lot of variables, you can use *c_across()* to succinctly select many variables (`c_across()` uses tidy select helpers)
+-   The *where(is.numeric())* ensures we only select numeric columns
+
+```{r}
+rf %>% summarize(total = sum(across(w:z)), .groups = "drop")
+
+rf %>% summarize(total = sum(c_across(w:z)), .groups = "drop")
+
+df %>% 
+  rowwise(id) %>% 
+  summarize(total = sum(c_across(where(is.numeric))), 
+            .groups = "drop")
+
+rf %>% mutate(total = sum(across(w:z)))
+rf %>% mutate(mean = mean(c_across(w:z)))
+
+rf %>% mutate(total = sum(c_across(w:z)))
+
+df %>% 
+  rowwise(id) %>% 
+  mutate(total = sum(c_across(where(is.numeric)))
+         )
+
+# If we want to use our fruits example... 
+fruits %>% 
+  rowwise(fruit) %>% 
+  mutate(height_mean = mean(c_across(contains("height"))))
+```
+
+## Using both c_across and across
+-   so c_across is a rowwise version of the function we learned earlier, across.
+
+-   You could combine c_across with column-wise across to compute the proportion of the total for each column:
+
+```{r}
+rf %>% #our row-wise data frame
+  mutate(total = sum(c_across(w:z))) %>% #total each row
+  ungroup() %>% # ungroup the rows
+  mutate(across(w:z, ~ .x / total)) # the .x represents each column
+```
+
+## Exercise
+
+- Let's create a new variable for the starwars data frame with the maximum of the height, mass, or birth year for each starwars character. Who has the maximum of all the characters?
+
+```{r}
+starwars %>% 
+  filter(!is.na(height), !is.na(mass), !is.na(birth_year)) %>%
+  rowwise() %>% 
+  mutate(max_a = max(height, mass, birth_year, na.rm = TRUE)) %>% 
+  relocate(max_a) %>% # move the variable to the first column
+  ungroup() %>% 
+  select(name, where(is.numeric)) %>% 
+  slice_max(max_a) # slice() lets you index rows by their (integer) locations. 
+
+# alt.
+starwars %>% 
+  filter(!is.na(height), !is.na(mass)) %>%
+  rowwise() %>% 
+  mutate(max_a = max(c(height, mass, birth_year), na.rm = TRUE)) %>% 
+  relocate(max_a) %>% 
+  ungroup() %>% 
+  select(name, where(is.numeric)) %>% 
+  filter(max_a == max(max_a))
+```
+
+
+
+# References
+
+-   Statistical programming in R: <https://american-stat-412612.netlify.app/>
+
+-   Column-wise operations: [https://dplyr.tidyverse.org/articles/colwise.html](https://dplyr.tidyverse.org/articles/colwise.html) 
+
+-   Row-wise operations: [https://dplyr.tidyverse.org/articles/rowwise.html](https://dplyr.tidyverse.org/articles/rowwise.html)
